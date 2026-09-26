@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; padding: 14px; background: #1c1916; color: #ece4d8; font: 13px "Segoe UI", sans-serif; }
+  h1 { font-size: 15px; letter-spacing: .12em; margin: 0 0 8px; }
+  h1 b { color: #ce422b; }
+  #status { color: #8e8478; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #86a94e; margin-right: 6px;
+         animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+</style>
+</head>
+<body>
+  <h1>RUST<b>3D</b></h1>
+  <div><span class="dot"></span><span id="status">Жду модели из Rust3D…</span></div>
+<script>
+  // The desktop app drops a .txt ticket with a media path into the inbox; host.jsx imports it.
+  function poll() {
+    window.__adobe_cep__.evalScript("rust3dCheckInbox()", function (res) {
+      if (res && res !== "0" && res.indexOf("Error") !== 0) {
+        document.getElementById("status").textContent = "Импортировано: " + res;
+      }
+    });
+  }
+  setInterval(poll, 1500);
+</script>
+</body>
+</html>
