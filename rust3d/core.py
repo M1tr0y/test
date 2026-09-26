@@ -136,11 +136,19 @@ def detect_rust():
 
 # ---------------------------------------------------------------- downloads
 
-def _github_latest_assets(repo):
-    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
+def _github_find_asset(repo, score):
+    """Newest release asset with the best positive score. Scans all releases, not
+    /releases/latest: FBX2glTF only has pre-releases, so "latest" is a 404 there."""
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases?per_page=20",
                                  headers={"User-Agent": APP_NAME})
     with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)["assets"]
+        releases = json.load(r)
+    for release in releases:
+        scored = [(score(a["name"].lower()), a) for a in release["assets"]]
+        scored = [s for s in scored if s[0] > 0]
+        if scored:
+            return max(scored, key=lambda s: s[0])[1]
+    return None
 
 
 def _download(url, dest, log):
@@ -154,16 +162,13 @@ def _download(url, dest, log):
 
 def install_assetstudio(log=print):
     """Download the Windows build of AssetStudioModCLI (prefers net472: no extra runtime needed)."""
-    assets = _github_latest_assets("aelurum/AssetStudio")
+    def score(n):
+        if "assetstudiomodcli" not in n or not n.endswith(".zip") or "linux" in n or "mac" in n:
+            return 0
+        return 1 + (2 if "net472" in n else 0) + (1 if "win" in n else 0)
 
-    def score(name):
-        n = name.lower()
-        if "cli" not in n or not n.endswith(".zip") or "linux" in n or "mac" in n:
-            return -1
-        return (2 if "net472" in n else 0) + (1 if "win" in n else 0)
-
-    best = max(assets, key=lambda a: score(a["name"]))
-    if score(best["name"]) < 0:
+    best = _github_find_asset("aelurum/AssetStudio", score)
+    if not best:
         raise RuntimeError("Не нашёл Windows-сборку AssetStudioModCLI в релизах")
     target = TOOLS_DIR / "AssetStudioModCLI"
     archive = _download(best["browser_download_url"], TOOLS_DIR / best["name"], log)
@@ -178,8 +183,8 @@ def install_assetstudio(log=print):
 
 
 def install_fbx2gltf(log=print):
-    assets = _github_latest_assets("facebookincubator/FBX2glTF")
-    asset = next((a for a in assets if "windows" in a["name"].lower()), None)
+    asset = _github_find_asset("facebookincubator/FBX2glTF",
+                               lambda n: 1 if "windows" in n and n.endswith(".exe") else 0)
     if not asset:
         raise RuntimeError("Не нашёл Windows-сборку FBX2glTF")
     return str(_download(asset["browser_download_url"], TOOLS_DIR / "FBX2glTF.exe", log))
