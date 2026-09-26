@@ -5,5 +5,5 @@ cd /d "%~dp0"
 ".venv\Scripts\pyinstaller.exe" --noconfirm --onefile --windowed --name Rust3D ^
   --add-data "ui;ui" --add-data "blender;blender" --add-data "premiere_panel;premiere_panel" ^
   run.py
-echo Готово: dist\Rust3D.exe
+echo Done: dist\Rust3D.exe
 pause
