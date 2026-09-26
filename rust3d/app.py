@@ -129,6 +129,10 @@ class Api:
 
 
 def main():
+    if not hasattr(webview, "create_window"):
+        where = getattr(webview, "__file__", None) or list(getattr(webview, "__path__", []))
+        raise SystemExit(f"pywebview is broken or shadowed: 'webview' was loaded from {where}. "
+                         "Delete the .venv folder and run install.bat again.")
     api = Api()
     ui = core.ROOT / "ui" / "index.html"
     # Underscore attributes are private to pywebview, so the window/config are not exposed to JS.
