@@ -164,15 +164,15 @@
       if (!index.bundles[f] || index.bundles[f].stamp !== stamp) todo.push({ file: f, stamp, size: st.size });
     }
     for (const k of Object.keys(index.bundles)) if (!files.includes(k)) delete index.bundles[k];
+    scanning = todo.length > 0;
+    const total = todo.length;
+    if (scanning) scanProgress(0, total);
     rebuildModels();
     render(true);
-    if (!todo.length) return;
+    if (!scanning) return;
 
-    scanning = true;
     todo.sort((a, b) => b.size - a.size);  // big bundles first keeps all workers busy
-    const total = todo.length;
     let done = 0;
-    scanProgress(0, total);
     const tmpRoot = path.join(APP_DIR, "cache", "scan");
 
     const worker = async () => {
