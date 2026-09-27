@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Rust3D</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand"><span class="mark">R</span>RUST<b>3D</b></div>
+    <span class="host" id="host"></span>
+    <div class="spacer"></div>
+    <button class="icon" id="gear" title="Настройки">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    </button>
+  </header>
+
+  <div class="search">
+    <input id="q" placeholder="Поиск: ak47, bradley, hazmat…" autocomplete="off" spellcheck="false">
+    <span class="count" id="count"></span>
+  </div>
+
+  <div class="scanbar off" id="scanbar"><div class="fill"></div><span></span></div>
+
+  <div class="list" id="list"></div>
+
+  <div class="empty hidden" id="empty">
+    <div class="crate"></div>
+    <h3 id="emptyTitle"></h3>
+    <p id="emptyText"></p>
+  </div>
+
+  <footer>
+    <div class="sel-name"><small>Модель:</small><b id="selName">не выбрана</b></div>
+    <button class="go" id="go" disabled><span class="fill"></span><span class="label" id="goLabel"></span></button>
+  </footer>
+</div>
+
+<aside class="drawer" id="drawer">
+  <div class="sheet">
+    <h2>Настройки <span class="spacer"></span><button class="icon close" id="closeSettings" title="Закрыть">✕</button></h2>
+
+    <div class="field" data-key="rustDir" data-dir="1" data-title="Папка с игрой Rust">
+      <small>Папка Rust</small>
+      <div class="row"><span class="val"></span><button>Изменить</button></div>
+    </div>
+    <div class="field" data-key="blender" data-title="blender.exe">
+      <small>Blender (нужен для Premiere)</small>
+      <div class="row"><span class="val"></span><button>Изменить</button></div>
+    </div>
+    <div class="field" data-key="exportDir" data-dir="1" data-title="Куда сохранять модели">
+      <small>Папка моделей</small>
+      <div class="row"><span class="val"></span><button>Изменить</button></div>
+    </div>
+
+    <div class="btns">
+      <button id="rescan">Перечитать игру</button>
+      <button id="openFolder">Открыть папку моделей</button>
+    </div>
+
+    <small class="label">Журнал</small>
+    <pre id="log"></pre>
+  </div>
+</aside>
+
+<div id="toasts"></div>
+<script src="js/main.js"></script>
+</body>
+</html>
