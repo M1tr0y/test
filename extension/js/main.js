@@ -1,12 +1,12 @@
 /* Rust3D panel for After Effects / Premiere Pro (CEP with Node.js).
  *
  * Scan:    one AssetStudioModCLI "info" run per .bundle, several in parallel; the model
- *          index is cached per bundle (size + mtime), so a game update rescans only
- *          what changed and the list is usable while scanning.
- * Export:  splitObjects -> FBX (fallback: mesh -> OBJ) -> FBX2glTF/Blender -> GLB,
- *          cached in the export folder; one export runs at a time.
- * Preview: selecting a model exports it in the background and shows it textured in a
- *          three.js viewer, so the main button is instant afterwards.
+ *          index is cached per bundle (size + mtime). Meshes are grouped by name without
+ *          the _LODn suffix and only the best LOD is listed.
+ * Preview: stage 1 exports just the mesh (fast, loads only meshes) and shows it as clay;
+ *          stage 2 exports the textured object and swaps it in. Selecting another model
+ *          kills the running preview export.
+ * Export:  splitObjects (exact LOD object) -> FBX2glTF/Blender -> GLB, cached on disk.
  * Import:  AE takes the GLB as a 3D layer; Premiere gets a Blender turntable video.
  */
 (function () {
@@ -27,6 +27,7 @@
   const INDEX_VERSION = 3;  // 2 cached empty lists because of the assets.xml BOM
   const SCAN_WORKERS = Math.max(2, Math.min(4, Math.floor(os.cpus().length / 2)));
   const LIST_LIMIT = 300;
+  const LOD_RE = /[_\s.-]*lod[_\s]?(\d+)$/i;
   const CANCELLED = new Error("cancelled");
 
   const HOST = JSON.parse(window.__adobe_cep__.getHostEnvironment()).appName;  // "AEFT" | "PPRO"
@@ -39,7 +40,7 @@
   };
   let cfg = Object.assign({}, DEFAULTS, readJson(CONFIG, {}));
   let index = { version: INDEX_VERSION, bundles: {} };
-  let models = [];      // rebuilt after every scanned bundle, so compare models by idOf(), not identity
+  let models = [];        // rebuilt after every scanned bundle, so compare models by idOf(), not identity
   let selected = null;
   let previewFor = null;  // idOf() of the model the preview should show
   let busy = false;
@@ -72,6 +73,7 @@
   const exists = p => !!p && fs.existsSync(p);
   const safe = n => String(n).replace(/[<>:"/\\|?*\x00-\x1f]+/g, "_").trim() || "model";
   const fileUrl = p => "file:///" + encodeURI(p.replace(/\\/g, "/")).replace(/#/g, "%23");
+  const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   function log(line) {
     const text = new Date().toLocaleTimeString("ru") + "  " + line;
@@ -81,11 +83,13 @@
     if (drawerOpen()) renderLog();
   }
 
-  function run(exe, args, label, onLine) {
+  // holder (optional) receives the child process so a stale preview export can be killed.
+  function run(exe, args, label, onLine, holder) {
     return new Promise((resolve, reject) => {
       args = args.map(String);
       log("> " + [exe].concat(args).map(a => (/\s/.test(a) ? `"${a}"` : a)).join(" "));
       const child = cp.spawn(exe, args, { windowsHide: true });
+      if (holder) holder.child = child;
       const tail = [];
       const onData = chunk => String(chunk).split(/\r?\n/).forEach(l => {
         if (!l.trim()) return;
@@ -97,8 +101,11 @@
       child.stdout.on("data", onData);
       child.stderr.on("data", onData);
       child.on("error", e => reject(new Error(`${label}: ${e.message}`)));
-      child.on("close", code => (code === 0 ? resolve()
-        : reject(new Error(`${label} завершился с ошибкой ${code}. ${tail.slice(-2).join(" | ")}`))));
+      child.on("close", code => {
+        if (holder && holder.child === child) holder.child = null;
+        if (code === 0) resolve();
+        else reject(new Error(`${label} завершился с ошибкой ${code}. ${tail.slice(-2).join(" | ")}`));
+      });
     });
   }
 
@@ -145,15 +152,27 @@
       .filter(m => m.name);
   }
 
+  // One entry per model: "X_LOD0", "X_LOD1", "X_LOD2" -> just "X" backed by the best LOD.
   function rebuildModels() {
-    const list = [];
+    const best = new Map();
     for (const bundle of Object.keys(index.bundles)) {
       for (const m of index.bundles[bundle].models) {
-        list.push({ name: m.name, container: m.container, pathId: m.pathId, bundle,
-                    lname: m.name.toLowerCase(), lcont: (m.container || "").toLowerCase() });
+        const lod = LOD_RE.exec(m.name);
+        const base = lod ? m.name.slice(0, lod.index) : m.name;
+        const level = lod ? +lod[1] : 0;
+        const key = bundle + "|" + base.toLowerCase() + "|" + (m.container || "").toLowerCase();
+        const prev = best.get(key);
+        if (prev && prev.level <= level) continue;
+        best.set(key, { name: m.name, base: base || m.name, level, container: m.container, pathId: m.pathId, bundle });
       }
     }
-    list.sort((a, b) => (a.lname < b.lname ? -1 : a.lname > b.lname ? 1 : 0));
+    const list = Array.from(best.values());
+    list.forEach(m => {
+      m.title = m.base;
+      m.lname = m.name.toLowerCase();
+      m.search = (m.base + " " + (m.container || "")).toLowerCase();
+    });
+    list.sort((a, b) => a.title.localeCompare(b.title, "en", { sensitivity: "base" }));
     list.forEach((m, i) => (m.i = i));
     const keep = selected && list.find(m => idOf(m) === idOf(selected));
     models = list;
@@ -197,7 +216,7 @@
           const found = parseAssetList(path.join(out, "assets.xml"));
           index.bundles[job.file] = { stamp: job.stamp, models: found };
           writeJson(INDEX, index);
-          log(`${path.basename(job.file)}: ${found.length} моделей`);
+          log(`${path.basename(job.file)}: ${found.length} сеток`);
         } catch (e) {
           log("! " + path.basename(job.file) + ": " + e.message);  // not cached, retried on the next scan
         }
@@ -217,60 +236,101 @@
   // ================================================================ export
 
   function modelDir(m) { return path.join(cfg.exportDir, `${safe(m.name)}_${String(m.pathId).replace("-", "n")}`); }
-  function glbPath(m) { return path.join(modelDir(m), safe(m.name) + ".glb"); }
+  function glbPath(m) { return path.join(modelDir(m), safe(m.title) + ".glb"); }
   function thumbPath(m) { return path.join(modelDir(m), "thumb.png"); }
   function hasBlender() { return exists(cfg.blender); }
 
-  async function exportGlb(m, step) {
+  // Stage 1: only the mesh, by PathID. AssetStudio loads just meshes, so this is the fast one.
+  async function exportQuick(m, holder) {
+    const dir = path.join(modelDir(m), "quick");
+    let obj = findFiles(dir, ".obj")[0];
+    if (obj) return obj;
+    rmrf(dir);
+    fs.mkdirSync(dir, { recursive: true });
+    await run(cfg.assetStudio, [m.bundle, "-m", "export", "-t", "mesh", "--filter-by-pathid", m.pathId,
+                                "-g", "none", "-o", dir], "AssetStudio", null, holder);
+    obj = findFiles(dir, ".obj")[0];
+    if (!obj) throw new Error("AssetStudio не выгрузил сетку");
+    return obj;
+  }
+
+  // Stage 2: the textured object. Targets the exact LOD object; the base name (the whole
+  // prefab) is only a fallback because it would carry every LOD on top of each other.
+  async function exportGlb(m, step, holder) {
     const glb = glbPath(m);
     if (exists(glb)) return glb;
     const raw = path.join(modelDir(m), "raw");
     rmrf(raw);
     fs.mkdirSync(raw, { recursive: true });
 
-    step("Достаю модель из игры…", 12);
-    await run(cfg.assetStudio, [m.bundle, "-m", "splitObjects", "--filter-by-name", m.name, "-o", raw], "AssetStudio");
-    // GameObject names contain the mesh name: prefer an exact match, else the biggest (most complete) one.
+    step("Достаю модель с текстурами…", 12);
+    const names = m.base !== m.name ? `^(?:${escapeRe(m.name)}|${escapeRe(m.base)})$` : `^${escapeRe(m.name)}$`;
+    await run(cfg.assetStudio, [m.bundle, "-m", "splitObjects", "--filter-by-name", names, "--filter-with-regex",
+                                "-o", raw], "AssetStudio", null, holder);
+    const rank = p => {
+      const stem = path.basename(p, ".fbx").toLowerCase();
+      return stem === m.lname ? 2 : stem === m.base.toLowerCase() ? 1 : 0;
+    };
     const fbx = findFiles(raw, ".fbx")
-      .map(p => ({ p, exact: path.basename(p, ".fbx").toLowerCase() === m.lname, size: fs.statSync(p).size }))
-      .sort((a, b) => (b.exact - a.exact) || (b.size - a.size));
+      .map(p => ({ p, rank: rank(p), size: fs.statSync(p).size }))
+      .sort((a, b) => (b.rank - a.rank) || (b.size - a.size));
     let src = fbx.length ? fbx[0].p : null;
     if (!src) {
-      step("Объект не найден, достаю сетку…", 30);
-      await run(cfg.assetStudio, [m.bundle, "-m", "export", "-t", "mesh", "--filter-by-pathid", m.pathId,
-                                  "-g", "none", "-o", raw], "AssetStudio");
-      src = findFiles(raw, ".obj")[0];
+      log("Объект с текстурами не найден — беру сетку без текстур");
+      src = await exportQuick(m, holder);
     }
-    if (!src) throw new Error("AssetStudio ничего не выгрузил для этой модели");
 
     step("Конвертирую с текстурами…", 50);
     if (/\.fbx$/i.test(src) && exists(cfg.fbx2gltf)) {
       try {
-        await run(cfg.fbx2gltf, ["--binary", "--input", src, "--output", glb.replace(/\.glb$/i, "")], "FBX2glTF");
+        await run(cfg.fbx2gltf, ["--binary", "--input", src, "--output", glb.replace(/\.glb$/i, "")], "FBX2glTF", null, holder);
       } catch (e) { log("FBX2glTF не справился, пробую Blender"); }
     }
     if (!exists(glb)) {
       if (!hasBlender()) throw new Error("Для этой модели нужен Blender — укажи его в настройках");
-      await run(cfg.blender, ["-b", "--factory-startup", "-P", path.join(EXT_DIR, "blender", "convert.py"), "--", src, glb], "Blender");
+      await run(cfg.blender, ["-b", "--factory-startup", "-P", path.join(EXT_DIR, "blender", "convert.py"), "--", src, glb],
+                "Blender", null, holder);
     }
     if (!exists(glb)) throw new Error("Не получилось собрать GLB");
     return glb;
   }
 
-  // One export at a time (each one loads a whole game bundle); callers share an in-flight export.
+  // One export at a time (each one loads a whole game bundle); callers share an in-flight job.
   let exportChain = Promise.resolve();
+  let currentJob = null;
   const inflight = new Map();
 
-  function getGlb(m, step, wanted) {
-    const key = glbPath(m);
-    if (exists(key)) return Promise.resolve(key);
-    if (inflight.has(key)) return inflight.get(key);
-    const job = () => { if (wanted && !wanted()) throw CANCELLED; return exportGlb(m, step); };
+  function enqueue(key, id, fn, wanted, preview) {
+    const running = inflight.get(key);
+    if (running) {
+      if (!preview) running.holder.preview = false;  // someone needs the result: never kill it
+      return running.promise;
+    }
+    const holder = { id, preview, child: null };
+    const job = () => {
+      if (wanted && !wanted()) throw CANCELLED;
+      currentJob = holder;
+      return fn(holder);
+    };
     const p = exportChain.then(job, job);
     exportChain = p.catch(() => {});
-    const tracked = p.finally(() => inflight.delete(key));
-    inflight.set(key, tracked);
-    return tracked;
+    const promise = p.finally(() => {
+      inflight.delete(key);
+      if (currentJob === holder) currentJob = null;
+    });
+    inflight.set(key, { promise, holder });
+    return promise;
+  }
+
+  function getQuick(m, wanted) {
+    const cached = findFiles(path.join(modelDir(m), "quick"), ".obj")[0];
+    if (cached) return Promise.resolve(cached);
+    return enqueue("q|" + idOf(m), idOf(m), h => exportQuick(m, h), wanted, true);
+  }
+
+  function getGlb(m, step, wanted, preview) {
+    if (exists(glbPath(m))) return Promise.resolve(glbPath(m));
+    return enqueue("g|" + idOf(m), idOf(m), h => exportGlb(m, step, h), wanted, !!preview);
   }
 
   async function turntable(glb, step) {
@@ -293,18 +353,18 @@
     if (!m || busy) return;
     busy = true;
     const step = (text, pct) => goProgress(text, pct);
-    step(exists(glbPath(m)) ? "Запускаю…" : "Готовлю модель…", 8);
+    step(exists(glbPath(m)) ? "Запускаю…" : "Готовлю модель с текстурами…", 8);
     try {
-      const glb = await getGlb(m, step);
+      const glb = await getGlb(m, step, null, false);
       if (HOST === "AEFT") {
         step("Добавляю в композицию…", 92);
         await evalHost("rust3dImportAE", [glb, cfg.width, cfg.height, cfg.fps]);
-        goDone(`«${m.name}» в композиции`);
+        goDone(`«${m.title}» в композиции`);
       } else {
         const mov = await turntable(glb, step);
         step("Кладу на таймлайн…", 96);
         const res = await evalHost("rust3dImportPPRO", [mov, cfg.turntableSeconds]);
-        goDone(res === "ok:timeline" ? `«${m.name}» на таймлайне` : `«${m.name}» в папке Rust3D проекта`);
+        goDone(res === "ok:timeline" ? `«${m.title}» на таймлайне` : `«${m.title}» в папке Rust3D проекта`);
       }
     } catch (e) {
       log("! " + e.message);
@@ -324,6 +384,7 @@
       loadThree.p = Promise.all([
         import("three"),
         import("three/addons/loaders/GLTFLoader.js"),
+        import("three/addons/loaders/OBJLoader.js"),
         import("three/addons/controls/OrbitControls.js"),
       ]).catch(e => { loadThree.p = null; throw e; });
     }
@@ -332,7 +393,7 @@
 
   async function ensureViewer() {
     if (viewer) return viewer;
-    const [THREE, { GLTFLoader }, { OrbitControls }] = await loadThree();
+    const [THREE, { GLTFLoader }, { OBJLoader }, { OrbitControls }] = await loadThree();
     const canvas = $("#view");
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, preserveDrawingBuffer: true });
     renderer.setPixelRatio(window.devicePixelRatio || 1);
@@ -353,7 +414,8 @@
     controls.autoRotate = true;
     controls.autoRotateSpeed = 2.4;
     canvas.addEventListener("pointerdown", () => (controls.autoRotate = false));
-    viewer = { THREE, loader: new GLTFLoader(), renderer, scene, camera, controls, model: null };
+    const clay = new THREE.MeshStandardMaterial({ color: 0xb8ada0, roughness: 0.85, metalness: 0.05 });
+    viewer = { THREE, gltf: new GLTFLoader(), obj: new OBJLoader(), clay, renderer, scene, camera, controls, model: null, shownId: null };
 
     const resize = () => {
       const w = canvas.clientWidth, h = canvas.clientHeight;
@@ -373,32 +435,28 @@
     return viewer;
   }
 
-  function disposeModel(obj) {
+  function disposeModel(v, obj) {
     obj.traverse(o => {
       if (o.geometry) o.geometry.dispose();
       [].concat(o.material || []).forEach(mat => {
+        if (mat === v.clay) return;
         for (const k in mat) if (mat[k] && mat[k].isTexture) mat[k].dispose();
         mat.dispose();
       });
     });
   }
 
-  async function showModel(glb, id) {
-    const v = await ensureViewer();
-    const buf = fs.readFileSync(glb);
-    const data = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-    const gltf = await new Promise((res, rej) => v.loader.parse(data, "", res, rej));
-    if (previewFor !== id) { disposeModel(gltf.scene); return; }
-    if (v.model) { v.scene.remove(v.model); disposeModel(v.model); }
-
-    const obj = gltf.scene;
+  // Puts obj on stage, framed; keeps the camera when only swapping clay for the textured version.
+  function presentModel(v, obj, id) {
+    if (v.model) { v.scene.remove(v.model); disposeModel(v, v.model); }
     const box = new v.THREE.Box3().setFromObject(obj);
     const center = box.getCenter(new v.THREE.Vector3());
     const radius = Math.max(box.getSize(new v.THREE.Vector3()).length() / 2, 1e-3);
     obj.position.sub(center);
     v.scene.add(obj);
     v.model = obj;
-
+    if (v.shownId === id) return;
+    v.shownId = id;
     const fov = (v.camera.fov * Math.PI) / 180;
     const dist = (radius / Math.sin(Math.min(fov, fov * v.camera.aspect) / 2)) * 1.05;
     v.camera.position.set(0.62, 0.38, 0.69).normalize().multiplyScalar(dist);
@@ -408,13 +466,30 @@
     v.controls.target.set(0, 0, 0);
     v.controls.autoRotate = true;
     v.controls.update();
-    stageState("ready");
-    setTimeout(() => saveThumb(id), 350);
   }
 
-  function saveThumb(id) {
+  async function showClay(objFile, id) {
+    const v = await ensureViewer();
+    const obj = v.obj.parse(fs.readFileSync(objFile, "utf8"));
+    if (previewFor !== id) return false;
+    obj.traverse(o => { if (o.isMesh) { o.material = v.clay; o.geometry.computeVertexNormals(); } });
+    presentModel(v, obj, id);
+    return true;
+  }
+
+  async function showTextured(glb, id) {
+    const v = await ensureViewer();
+    const buf = fs.readFileSync(glb);
+    const data = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    const gltf = await new Promise((res, rej) => v.gltf.parse(data, "", res, rej));
+    if (previewFor !== id) { disposeModel(v, gltf.scene); return false; }
+    presentModel(v, gltf.scene, id);
+    return true;
+  }
+
+  function saveThumb(id, overwrite) {
     const m = selected;
-    if (!m || previewFor !== id || idOf(m) !== id || exists(thumbPath(m))) return;
+    if (!m || previewFor !== id || idOf(m) !== id || (!overwrite && exists(thumbPath(m)))) return;
     const src = $("#view");
     const size = 96, s = Math.min(src.width, src.height);
     if (!s) return;
@@ -423,7 +498,7 @@
     c.getContext("2d").drawImage(src, (src.width - s) / 2, (src.height - s) / 2, s, s, 0, 0, size, size);
     fs.writeFileSync(thumbPath(m), Buffer.from(c.toDataURL("image/png").split(",")[1], "base64"));
     const ico = document.querySelector(`.item[data-i="${m.i}"] .ico`);
-    if (ico) ico.innerHTML = `<img src="${fileUrl(thumbPath(m))}">`;
+    if (ico) ico.innerHTML = `<img src="${fileUrl(thumbPath(m))}?${Date.now()}">`;
   }
 
   function stageState(kind, text) {
@@ -431,6 +506,13 @@
     overlay.classList.toggle("off", kind === "ready");
     overlay.classList.toggle("err", kind === "error");
     if (text) $("#stageText").textContent = text;
+  }
+
+  function stageBadge(text, err) {
+    const b = $("#stageBadge");
+    b.classList.toggle("off", !text);
+    b.classList.toggle("err", !!err);
+    if (text) $("#stageBadgeText").textContent = text;
   }
 
   function hidePreview() {
@@ -441,23 +523,45 @@
   function schedulePreview(m) {
     const id = idOf(m);
     previewFor = id;
+    // A preview export for another model is useless now: stop it so this one starts right away.
+    if (currentJob && currentJob.preview && currentJob.id !== id && currentJob.child) {
+      try { currentJob.child.kill(); } catch (e) { /* already exited */ }
+    }
     $("#stage").classList.remove("hidden");
-    stageState("loading", exists(glbPath(m)) ? "Загружаю…" : "Достаю модель из игры…");
+    stageBadge(null);
+    stageState("loading", exists(glbPath(m)) ? "Загружаю…" : "Достаю форму модели…");
     clearTimeout(previewTimer);
-    previewTimer = setTimeout(() => runPreview(m, id), 250);
+    previewTimer = setTimeout(() => runPreview(m, id), 200);
   }
 
   async function runPreview(m, id) {
-    if (previewFor !== id) return;
+    const wanted = () => previewFor === id;
+    if (!wanted()) return;
+    let clayShown = false;
     try {
-      const glb = await getGlb(m, text => { if (previewFor === id) stageState("loading", text); }, () => previewFor === id);
-      if (previewFor !== id) return;
-      stageState("loading", "Загружаю предпросмотр…");
-      await showModel(glb, id);
+      if (!exists(glbPath(m))) {
+        const objFile = await getQuick(m, wanted);
+        if (!wanted()) return;
+        clayShown = await showClay(objFile, id);
+        if (!clayShown) return;
+        stageState("ready");
+        stageBadge("Загружаю текстуры…");
+        setTimeout(() => saveThumb(id, false), 350);
+      }
+      const glb = await getGlb(m, text => { if (wanted()) stageBadge(text); }, wanted, true);
+      if (!wanted()) return;
+      if (!(await showTextured(glb, id))) return;
+      stageState("ready");
+      stageBadge(null);
+      setTimeout(() => saveThumb(id, true), 350);
+      const row = document.querySelector(`.item[data-i="${m.i}"]`);
+      if (row && !row.querySelector(".ready")) row.insertAdjacentHTML("beforeend", '<span class="ready">✓</span>');
     } catch (e) {
-      if (e === CANCELLED || previewFor !== id) return;
+      if (e === CANCELLED || !wanted()) return;
       const offline = /fetch|import|module/i.test(e.message);
-      stageState("error", offline ? "Для предпросмотра нужен интернет (загрузка 3D-движка)" : e.message);
+      const text = offline ? "Для предпросмотра нужен интернет (загрузка 3D-движка)" : e.message;
+      if (clayShown) stageBadge("Текстуры не загрузились", true);
+      else stageState("error", text);
       log("! предпросмотр: " + e.message);
     }
   }
@@ -476,7 +580,7 @@
 
   function filtered() {
     const q = $("#q").value.trim().toLowerCase();
-    return { q, hits: q ? models.filter(m => m.lname.includes(q) || m.lcont.includes(q)) : models };
+    return { q, hits: q ? models.filter(m => m.search.includes(q)) : models };
   }
 
   function icon(m) {
@@ -498,13 +602,13 @@
       list.innerHTML = hits.slice(0, LIST_LIMIT).map((m, n) =>
         `<div class="item${m === selected ? " sel" : ""}" data-i="${m.i}" style="animation-delay:${Math.min(n, 16) * 14}ms">
            <span class="ico">${icon(m)}</span>
-           <span class="t"><b>${highlight(m.name, q)}</b><small>${esc(m.container || path.basename(m.bundle))}</small></span>
+           <span class="t"><b>${highlight(m.title, q)}</b><small>${esc(m.container || path.basename(m.bundle))}</small></span>
            ${exists(glbPath(m)) ? '<span class="ready" title="Уже выгружена — вставится мгновенно">✓</span>' : ""}
          </div>`).join("") +
         (hits.length > LIST_LIMIT ? `<div class="more">Показано ${LIST_LIMIT} из ${hits.length.toLocaleString("ru")} — уточни поиск</div>` : "");
       if (!animate) list.scrollTop = scroll;
     }
-    $("#selName").textContent = selected ? selected.name : "не выбрана";
+    $("#selName").textContent = selected ? selected.title : "не выбрана";
     if (!busy) $("#go").disabled = !selected;
   }
 
@@ -514,7 +618,7 @@
     document.querySelectorAll(".item.sel").forEach(el => el.classList.remove("sel"));
     const el = document.querySelector(`.item[data-i="${m.i}"]`);
     if (el) { el.classList.add("sel"); el.scrollIntoView({ block: "nearest" }); }
-    $("#selName").textContent = m.name;
+    $("#selName").textContent = m.title;
     if (!busy) $("#go").disabled = false;
     if (previewFor !== idOf(m)) schedulePreview(m);
   }
@@ -637,7 +741,7 @@
     $("#q").addEventListener("keydown", e => {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         const hits = filtered().hits.slice(0, LIST_LIMIT);
-        const at = hits.indexOf(selected);
+        const at = selected ? hits.findIndex(h => idOf(h) === idOf(selected)) : -1;
         select(hits[Math.max(0, Math.min(hits.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)))]);
         e.preventDefault();
       } else if (e.key === "Enter") {
