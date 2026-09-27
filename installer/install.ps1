@@ -231,6 +231,14 @@ function Get-GitHubToken {
     if (Test-Path $file) { (Get-Content $file -Raw).Trim() } else { '' }
 }
 
+# HTTP status of a failed web call; PowerShell wraps the WebException in MethodInvocationException.
+function Get-HttpStatus($err) {
+    $ex = $err.Exception
+    while ($ex -and -not ($ex -is [Net.WebException])) { $ex = $ex.InnerException }
+    if ($ex -and $ex.Response) { return [int]$ex.Response.StatusCode }
+    0
+}
+
 function Find-Asset([string]$repo, [scriptblock]$score) {
     # All releases, not /latest: FBX2glTF only publishes pre-releases.
     $releases = Invoke-RestMethod "https://api.github.com/repos/$repo/releases?per_page=20" -Headers @{ 'User-Agent' = 'Rust3D' }
@@ -280,8 +288,8 @@ function Update-Program {
         $zip = Join-Path $tmp 'rust3d.zip'
         try {
             Get-File "https://api.github.com/repos/$Repo/zipball" $zip 2 10 'обновление' (Get-GitHubToken)
-        } catch [Net.WebException] {
-            $code = [int]$_.Exception.Response.StatusCode
+        } catch {
+            $code = Get-HttpStatus $_
             if ($code -eq 404 -or $code -eq 401) {
                 throw "GitHub не отдаёт файлы: репозиторий $Repo закрытый. Сделай его публичным (Settings → General → Change visibility) или положи токен GitHub в %APPDATA%\Rust3D\github_token.txt"
             }
