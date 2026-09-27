@@ -1,10 +1,14 @@
 ﻿# Rust3D installer: one window, one button. Puts the Rust3D panel into After Effects and
 # Premiere Pro, downloads AssetStudioModCLI + FBX2glTF and finds Rust and Blender.
+# -Update first pulls the latest version of this repository from GitHub.
+param([switch]$Update)
+
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+$Repo    = 'M1tr0y/test'
 $Root    = Split-Path -Parent $PSScriptRoot
 $AppDir  = Join-Path $env:APPDATA 'Rust3D'
 $Tools   = Join-Path $AppDir 'tools'
@@ -15,7 +19,7 @@ $script:finished = $false
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Rust3D" Width="500" Height="490" WindowStyle="None" AllowsTransparency="True"
+        Title="Rust3D" Width="500" SizeToContent="Height" WindowStyle="None" AllowsTransparency="True"
         Background="Transparent" WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         FontFamily="Bahnschrift, Segoe UI" Foreground="#ECE4D8">
   <Window.Resources>
@@ -94,7 +98,7 @@ $script:finished = $false
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
-        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
@@ -118,10 +122,15 @@ $script:finished = $false
         <TextBlock FontSize="34" FontWeight="Bold" VerticalAlignment="Center"><Run Text="RUST "/><Run Text="3D" Foreground="#CE422B"/></TextBlock>
       </StackPanel>
 
-      <TextBlock Grid.Row="2" HorizontalAlignment="Center" Margin="0,10,0,24" Foreground="#8E8478" FontSize="13"
+      <TextBlock x:Name="Subtitle" Grid.Row="2" HorizontalAlignment="Center" Margin="0,10,0,24" Foreground="#8E8478" FontSize="13"
                  Text="Модели из Rust в After Effects и Premiere Pro"/>
 
       <StackPanel Grid.Row="3">
+        <Grid x:Name="UpdRow" Margin="0,0,0,12" Visibility="Collapsed">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="30"/><ColumnDefinition/></Grid.ColumnDefinitions>
+          <TextBlock x:Name="Icon4" Text="○" Foreground="#5A5047" FontSize="15" VerticalAlignment="Center"/>
+          <TextBlock x:Name="Text4" Grid.Column="1" Text="Свежая версия с GitHub" Foreground="#8E8478" FontSize="14" VerticalAlignment="Center"/>
+        </Grid>
         <Grid Margin="0,0,0,12">
           <Grid.ColumnDefinitions><ColumnDefinition Width="30"/><ColumnDefinition/></Grid.ColumnDefinitions>
           <TextBlock x:Name="Icon0" Text="○" Foreground="#5A5047" FontSize="15" VerticalAlignment="Center"/>
@@ -217,6 +226,11 @@ function Set-Step([int]$i, [string]$state) {
 
 # ------------------------------------------------------------------ work helpers
 
+function Get-GitHubToken {
+    $file = Join-Path $AppDir 'github_token.txt'
+    if (Test-Path $file) { (Get-Content $file -Raw).Trim() } else { '' }
+}
+
 function Find-Asset([string]$repo, [scriptblock]$score) {
     # All releases, not /latest: FBX2glTF only publishes pre-releases.
     $releases = Invoke-RestMethod "https://api.github.com/repos/$repo/releases?per_page=20" -Headers @{ 'User-Agent' = 'Rust3D' }
@@ -229,9 +243,10 @@ function Find-Asset([string]$repo, [scriptblock]$score) {
     throw "Не нашёл файл для Windows в релизах $repo"
 }
 
-function Get-File([string]$url, [string]$dest, [double]$from, [double]$to, [string]$what) {
+function Get-File([string]$url, [string]$dest, [double]$from, [double]$to, [string]$what, [string]$token = '') {
     $req = [Net.HttpWebRequest]::Create($url)
     $req.UserAgent = 'Rust3D'
+    if ($token) { $req.Headers['Authorization'] = "token $token" }
     $resp = $req.GetResponse()
     $total = $resp.ContentLength
     $in = $resp.GetResponseStream()
@@ -257,8 +272,34 @@ function Get-File([string]$url, [string]$dest, [double]$from, [double]$to, [stri
     }
 }
 
+# Pulls the latest version of this repository and copies it over the program folder.
+function Update-Program {
+    $tmp = Join-Path $env:TEMP ('rust3d-update-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force $tmp | Out-Null
+    try {
+        $zip = Join-Path $tmp 'rust3d.zip'
+        try {
+            Get-File "https://api.github.com/repos/$Repo/zipball" $zip 2 10 'обновление' (Get-GitHubToken)
+        } catch [Net.WebException] {
+            $code = [int]$_.Exception.Response.StatusCode
+            if ($code -eq 404 -or $code -eq 401) {
+                throw "GitHub не отдаёт файлы: репозиторий $Repo закрытый. Сделай его публичным (Settings → General → Change visibility) или положи токен GitHub в %APPDATA%\Rust3D\github_token.txt"
+            }
+            throw
+        }
+        Set-Status 'Распаковываю обновление…'
+        $src = Join-Path $tmp 'src'
+        [IO.Compression.ZipFile]::ExtractToDirectory($zip, $src)
+        $top = Get-ChildItem $src -Directory | Select-Object -First 1
+        if (-not $top -or -not (Test-Path (Join-Path $top.FullName 'extension'))) { throw 'В обновлении нет папки extension' }
+        Copy-Item (Join-Path $top.FullName '*') $Root -Recurse -Force
+    } finally {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Read-Config {
-    $cfg = [ordered]@{ rustDir = ''; blender = ''; assetStudio = ''; fbx2gltf = ''; exportDir = '' }
+    $cfg = [ordered]@{ rustDir = ''; blender = ''; assetStudio = ''; fbx2gltf = ''; exportDir = ''; installDir = '' }
     $file = Join-Path $AppDir 'config.json'
     if (Test-Path $file) {
         try {
@@ -314,8 +355,15 @@ function Install {
     $ui.CloseBtn.IsEnabled = $false
     $step = 0
     try {
+        # 0. (update mode) Latest files from GitHub.
+        if ($Update) {
+            $step = 4; Set-Step 4 'run'; Set-Status 'Скачиваю свежую версию…'; Set-Progress 2
+            Update-Program
+            Set-Step 4 'ok'; Set-Progress 12
+        }
+
         # 1. Panel into the CEP extensions folder + allow unsigned panels.
-        Set-Step 0 'run'; Set-Status 'Ставлю панель…'; Set-Progress 4
+        $step = 0; Set-Step 0 'run'; Set-Status 'Ставлю панель…'; Set-Progress 14
         New-Item -ItemType Directory -Force $CepDir | Out-Null
         foreach ($old in 'com.rust3d.importer', $PanelId) {
             $p = Join-Path $CepDir $old
@@ -329,11 +377,12 @@ function Install {
             if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null }
             Set-ItemProperty $k -Name PlayerDebugMode -Value '1'
         }
-        Set-Step 0 'ok'; Set-Progress 10
+        Set-Step 0 'ok'; Set-Progress 18
 
         # 2. AssetStudioModCLI (skipped if already downloaded).
         $step = 1; Set-Step 1 'run'
         $cfg = Read-Config
+        $cfg.installDir = $Root
         $asDir = Join-Path $Tools 'AssetStudioModCLI'
         $asExe = Get-ChildItem $asDir -Recurse -Filter AssetStudioModCLI.exe -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $asExe) {
@@ -345,7 +394,7 @@ function Install {
             }
             New-Item -ItemType Directory -Force $Tools | Out-Null
             $zip = Join-Path $Tools $a.name
-            Get-File $a.browser_download_url $zip 10 55 'AssetStudio'
+            Get-File $a.browser_download_url $zip 18 58 'AssetStudio'
             Set-Status 'Распаковываю AssetStudio…'
             if (Test-Path $asDir) { Remove-Item $asDir -Recurse -Force }
             [IO.Compression.ZipFile]::ExtractToDirectory($zip, $asDir)
@@ -354,7 +403,7 @@ function Install {
             if (-not $asExe) { throw 'В архиве AssetStudio нет AssetStudioModCLI.exe' }
         }
         $cfg.assetStudio = $asExe.FullName
-        Set-Step 1 'ok'; Set-Progress 58
+        Set-Step 1 'ok'; Set-Progress 60
 
         # 3. FBX2glTF.
         $step = 2; Set-Step 2 'run'
@@ -363,7 +412,7 @@ function Install {
             Set-Status 'Ищу конвертер FBX2glTF…'
             $a = Find-Asset 'facebookincubator/FBX2glTF' { param($n) if ($n -like '*windows*' -and $n -like '*.exe') { 1 } else { 0 } }
             New-Item -ItemType Directory -Force $Tools | Out-Null
-            Get-File $a.browser_download_url $fbx 58 90 'FBX2glTF'
+            Get-File $a.browser_download_url $fbx 60 90 'FBX2glTF'
         }
         $cfg.fbx2gltf = $fbx
         Set-Step 2 'ok'; Set-Progress 92
@@ -381,7 +430,7 @@ function Install {
         Set-Progress 100
 
         $running = Get-Process AfterFX, 'Adobe Premiere Pro' -ErrorAction SilentlyContinue
-        $msg = if ($running) { 'Готово! Перезапусти After Effects / Premiere Pro, затем Окно → Расширения → Rust3D.' }
+        $msg = if ($running) { 'Готово! Закрой и снова открой панель Rust3D (Окно → Расширения → Rust3D).' }
                else { 'Готово! Открой After Effects или Premiere Pro → Окно → Расширения → Rust3D.' }
         if ($notes) { $msg += "`n" + ($notes -join "`n") }
         Set-Status $msg '#ECE4D8'
@@ -402,8 +451,15 @@ function Install {
 try {
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
     $ui = @{}
-    foreach ($n in 'Card', 'CloseBtn', 'Bar', 'Status', 'Go', 'Icon0', 'Icon1', 'Icon2', 'Icon3', 'Text0', 'Text1', 'Text2', 'Text3') {
+    foreach ($n in 'Card', 'CloseBtn', 'Bar', 'Status', 'Go', 'Subtitle', 'UpdRow',
+                   'Icon0', 'Icon1', 'Icon2', 'Icon3', 'Icon4', 'Text0', 'Text1', 'Text2', 'Text3', 'Text4') {
         $ui[$n] = $win.FindName($n)
+    }
+    if ($Update) {
+        $ui.UpdRow.Visibility = 'Visible'
+        $ui.Subtitle.Text = 'Обновление Rust3D'
+        $ui.Go.Content = 'ОБНОВИТЬ'
+        $ui.Status.Text = 'Скачаю свежую версию с GitHub и переустановлю панель.'
     }
 
     $win.Add_MouseLeftButtonDown({ try { $win.DragMove() } catch { } })
@@ -417,6 +473,8 @@ try {
         $ui.Card.RenderTransform.BeginAnimation([Windows.Media.ScaleTransform]::ScaleXProperty, $zoom)
         $ui.Card.RenderTransform.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $zoom)
     })
+    # Updates start on their own once the window is visible.
+    if ($Update) { $win.Add_ContentRendered({ Install }) }
     [void]$win.ShowDialog()
 } catch {
     [Windows.MessageBox]::Show("Не удалось запустить установщик:`n`n$($_.Exception.Message)", 'Rust3D') | Out-Null
