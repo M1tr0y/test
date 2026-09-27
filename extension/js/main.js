@@ -39,11 +39,13 @@
   };
   let cfg = Object.assign({}, DEFAULTS, readJson(CONFIG, {}));
   let index = { version: INDEX_VERSION, bundles: {} };
-  let models = [];
+  let models = [];      // rebuilt after every scanned bundle, so compare models by idOf(), not identity
   let selected = null;
+  let previewFor = null;  // idOf() of the model the preview should show
   let busy = false;
   let scanning = false;
   const logLines = [];
+  const idOf = m => m.bundle + "|" + m.pathId;
 
   // ================================================================ helpers
 
@@ -153,9 +155,9 @@
     }
     list.sort((a, b) => (a.lname < b.lname ? -1 : a.lname > b.lname ? 1 : 0));
     list.forEach((m, i) => (m.i = i));
-    const keep = selected && list.find(m => m.bundle === selected.bundle && m.pathId === selected.pathId);
+    const keep = selected && list.find(m => idOf(m) === idOf(selected));
     models = list;
-    if (keep) { keep.i = keep.i; selected = keep; previewFor = previewFor && keep; }
+    if (keep) selected = keep;
     else if (selected) { selected = null; hidePreview(); }
   }
 
@@ -315,7 +317,6 @@
   // ================================================================ 3D preview
 
   let viewer = null;
-  let previewFor = null;
   let previewTimer = null;
 
   function loadThree() {
@@ -382,12 +383,12 @@
     });
   }
 
-  async function showModel(glb, m) {
+  async function showModel(glb, id) {
     const v = await ensureViewer();
     const buf = fs.readFileSync(glb);
     const data = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     const gltf = await new Promise((res, rej) => v.loader.parse(data, "", res, rej));
-    if (previewFor !== m) { disposeModel(gltf.scene); return; }
+    if (previewFor !== id) { disposeModel(gltf.scene); return; }
     if (v.model) { v.scene.remove(v.model); disposeModel(v.model); }
 
     const obj = gltf.scene;
@@ -408,11 +409,12 @@
     v.controls.autoRotate = true;
     v.controls.update();
     stageState("ready");
-    setTimeout(() => saveThumb(m), 350);
+    setTimeout(() => saveThumb(id), 350);
   }
 
-  function saveThumb(m) {
-    if (previewFor !== m || exists(thumbPath(m))) return;
+  function saveThumb(id) {
+    const m = selected;
+    if (!m || previewFor !== id || idOf(m) !== id || exists(thumbPath(m))) return;
     const src = $("#view");
     const size = 96, s = Math.min(src.width, src.height);
     if (!s) return;
@@ -437,22 +439,23 @@
   }
 
   function schedulePreview(m) {
-    previewFor = m;
+    const id = idOf(m);
+    previewFor = id;
     $("#stage").classList.remove("hidden");
     stageState("loading", exists(glbPath(m)) ? "Загружаю…" : "Достаю модель из игры…");
     clearTimeout(previewTimer);
-    previewTimer = setTimeout(() => runPreview(m), 250);
+    previewTimer = setTimeout(() => runPreview(m, id), 250);
   }
 
-  async function runPreview(m) {
-    if (previewFor !== m) return;
+  async function runPreview(m, id) {
+    if (previewFor !== id) return;
     try {
-      const glb = await getGlb(m, text => { if (previewFor === m) stageState("loading", text); }, () => previewFor === m);
-      if (previewFor !== m) return;
+      const glb = await getGlb(m, text => { if (previewFor === id) stageState("loading", text); }, () => previewFor === id);
+      if (previewFor !== id) return;
       stageState("loading", "Загружаю предпросмотр…");
-      await showModel(glb, m);
+      await showModel(glb, id);
     } catch (e) {
-      if (e === CANCELLED || previewFor !== m) return;
+      if (e === CANCELLED || previewFor !== id) return;
       const offline = /fetch|import|module/i.test(e.message);
       stageState("error", offline ? "Для предпросмотра нужен интернет (загрузка 3D-движка)" : e.message);
       log("! предпросмотр: " + e.message);
@@ -513,7 +516,7 @@
     if (el) { el.classList.add("sel"); el.scrollIntoView({ block: "nearest" }); }
     $("#selName").textContent = m.name;
     if (!busy) $("#go").disabled = false;
-    if (previewFor !== m) schedulePreview(m);
+    if (previewFor !== idOf(m)) schedulePreview(m);
   }
 
   const EMPTY = {

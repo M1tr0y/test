@@ -3,6 +3,15 @@
 <head>
 <meta charset="utf-8">
 <title>Rust3D</title>
+<!-- three.js for the preview, loaded on first use (needs internet once per session). -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -31,6 +40,12 @@
     <p id="emptyText"></p>
   </div>
 
+  <div class="stage hidden" id="stage">
+    <canvas id="view"></canvas>
+    <div class="stage-overlay" id="stageOverlay"><div class="spinner"></div><span id="stageText"></span></div>
+    <span class="stage-hint">крути мышкой · колесо — зум</span>
+  </div>
+
   <footer>
     <div class="sel-name"><small>Модель:</small><b id="selName">не выбрана</b></div>
     <button class="go" id="go" disabled><span class="fill"></span><span class="label" id="goLabel"></span></button>
@@ -56,7 +71,8 @@
 
     <div class="btns">
       <button id="rescan">Перечитать игру</button>
-      <button id="openFolder">Открыть папку моделей</button>
+      <button id="openFolder">Папка моделей</button>
+      <button id="update">Обновить Rust3D</button>
     </div>
 
     <small class="label">Журнал</small>
