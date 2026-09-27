@@ -136,7 +136,17 @@ button:disabled { opacity: .45; pointer-events: none; }
   width: 26px; height: 26px; border-radius: 50%;
   border: 3px solid rgba(206, 66, 43, .2); border-top-color: var(--rust-2); animation: spin .8s linear infinite;
 }
+.spinner.small { flex: none; width: 12px; height: 12px; border-width: 2px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+.stage-badge {
+  position: absolute; top: 8px; right: 8px; max-width: calc(100% - 16px); display: flex; align-items: center; gap: 7px;
+  padding: 5px 10px; border-radius: 999px; background: rgba(16, 14, 13, .82); border: 1px solid var(--line);
+  font-size: 11px; color: var(--muted); transition: opacity .3s, transform .3s var(--ease);
+}
+.stage-badge span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage-badge.off { opacity: 0; transform: translateY(-6px); pointer-events: none; }
+.stage-badge.err { color: var(--rust-2); }
+.stage-badge.err .spinner { display: none; }
 .stage-hint { position: absolute; left: 10px; bottom: 7px; font-size: 10px; color: rgba(236, 228, 216, .35); pointer-events: none; }
 
 /* ---------- footer / main button ---------- */
