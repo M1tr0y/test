@@ -1,11 +1,13 @@
 /* Rust3D panel for After Effects / Premiere Pro (CEP with Node.js).
  *
- * Scan:   one AssetStudioModCLI "info" run per .bundle, several in parallel; the model
- *         index is cached per bundle (size + mtime), so a game update rescans only
- *         what changed and the list is usable while scanning.
- * Export: splitObjects -> FBX (fallback: mesh -> OBJ) -> FBX2glTF/Blender -> GLB,
- *         cached in the export folder so the second import of a model is instant.
- * Import: AE takes the GLB as a 3D layer; Premiere gets a Blender turntable video.
+ * Scan:    one AssetStudioModCLI "info" run per .bundle, several in parallel; the model
+ *          index is cached per bundle (size + mtime), so a game update rescans only
+ *          what changed and the list is usable while scanning.
+ * Export:  splitObjects -> FBX (fallback: mesh -> OBJ) -> FBX2glTF/Blender -> GLB,
+ *          cached in the export folder; one export runs at a time.
+ * Preview: selecting a model exports it in the background and shows it textured in a
+ *          three.js viewer, so the main button is instant afterwards.
+ * Import:  AE takes the GLB as a 3D layer; Premiere gets a Blender turntable video.
  */
 (function () {
   "use strict";
@@ -15,21 +17,23 @@
   const path = node.require("path");
   const os = node.require("os");
   const cp = node.require("child_process");
+  const { Buffer } = node.require("buffer");
   const env = node.process.env;
 
   const APP_DIR = path.join(env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Rust3D");
   const CONFIG = path.join(APP_DIR, "config.json");
   const INDEX = path.join(APP_DIR, "cache", "index.json");
   const LOG_FILE = path.join(APP_DIR, "rust3d.log");
-  const INDEX_VERSION = 2;
+  const INDEX_VERSION = 3;  // 2 cached empty lists because of the assets.xml BOM
   const SCAN_WORKERS = Math.max(2, Math.min(4, Math.floor(os.cpus().length / 2)));
   const LIST_LIMIT = 300;
+  const CANCELLED = new Error("cancelled");
 
   const HOST = JSON.parse(window.__adobe_cep__.getHostEnvironment()).appName;  // "AEFT" | "PPRO"
   const EXT_DIR = extensionDir();
 
   const DEFAULTS = {
-    rustDir: "", blender: "", assetStudio: "", fbx2gltf: "",
+    rustDir: "", blender: "", assetStudio: "", fbx2gltf: "", installDir: "",
     exportDir: path.join(os.homedir(), "Documents", "Rust3D"),
     width: 1920, height: 1080, fps: 30, turntableSeconds: 6,
   };
@@ -65,6 +69,7 @@
 
   const exists = p => !!p && fs.existsSync(p);
   const safe = n => String(n).replace(/[<>:"/\\|?*\x00-\x1f]+/g, "_").trim() || "model";
+  const fileUrl = p => "file:///" + encodeURI(p.replace(/\\/g, "/")).replace(/#/g, "%23");
 
   function log(line) {
     const text = new Date().toLocaleTimeString("ru") + "  " + line;
@@ -128,7 +133,10 @@
 
   function parseAssetList(file) {
     if (!exists(file)) return [];
-    const doc = new DOMParser().parseFromString(fs.readFileSync(file, "utf8"), "text/xml");
+    // XDocument.Save writes a UTF-8 BOM, which DOMParser rejects as "content before the XML declaration".
+    const xml = fs.readFileSync(file, "utf8").replace(/^﻿/, "");
+    const doc = new DOMParser().parseFromString(xml, "text/xml");
+    if (doc.getElementsByTagName("parsererror").length) throw new Error("не удалось прочитать assets.xml");
     const text = (el, tag) => { const n = el.getElementsByTagName(tag)[0]; return n ? n.textContent : ""; };
     return Array.from(doc.getElementsByTagName("Asset"))
       .map(a => ({ name: text(a, "Name"), container: text(a, "Container"), pathId: text(a, "PathID") }))
@@ -147,7 +155,8 @@
     list.forEach((m, i) => (m.i = i));
     const keep = selected && list.find(m => m.bundle === selected.bundle && m.pathId === selected.pathId);
     models = list;
-    selected = keep || null;
+    if (keep) { keep.i = keep.i; selected = keep; previewFor = previewFor && keep; }
+    else if (selected) { selected = null; hidePreview(); }
   }
 
   async function scan(force) {
@@ -183,10 +192,12 @@
         try {
           await run(cfg.assetStudio, [job.file, "-m", "info", "-t", "mesh", "--export-asset-list", "xml",
                                       "-o", out, "--log-level", "warning"], "AssetStudio");
-          index.bundles[job.file] = { stamp: job.stamp, models: parseAssetList(path.join(out, "assets.xml")) };
+          const found = parseAssetList(path.join(out, "assets.xml"));
+          index.bundles[job.file] = { stamp: job.stamp, models: found };
           writeJson(INDEX, index);
+          log(`${path.basename(job.file)}: ${found.length} моделей`);
         } catch (e) {
-          log("! " + path.basename(job.file) + ": " + e.message);  // retried on the next scan
+          log("! " + path.basename(job.file) + ": " + e.message);  // not cached, retried on the next scan
         }
         rmrf(out);
         scanProgress(++done, total, path.basename(job.file));
@@ -201,19 +212,17 @@
     toast(`Список готов: ${models.length.toLocaleString("ru")} моделей`);
   }
 
-  // ================================================================ export + import
+  // ================================================================ export
 
-  function glbPath(m) {
-    const dir = path.join(cfg.exportDir, `${safe(m.name)}_${String(m.pathId).replace("-", "n")}`);
-    return path.join(dir, safe(m.name) + ".glb");
-  }
-
+  function modelDir(m) { return path.join(cfg.exportDir, `${safe(m.name)}_${String(m.pathId).replace("-", "n")}`); }
+  function glbPath(m) { return path.join(modelDir(m), safe(m.name) + ".glb"); }
+  function thumbPath(m) { return path.join(modelDir(m), "thumb.png"); }
   function hasBlender() { return exists(cfg.blender); }
 
   async function exportGlb(m, step) {
     const glb = glbPath(m);
     if (exists(glb)) return glb;
-    const raw = path.join(path.dirname(glb), "raw");
+    const raw = path.join(modelDir(m), "raw");
     rmrf(raw);
     fs.mkdirSync(raw, { recursive: true });
 
@@ -232,7 +241,7 @@
     }
     if (!src) throw new Error("AssetStudio ничего не выгрузил для этой модели");
 
-    step("Конвертирую в GLB…", 50);
+    step("Конвертирую с текстурами…", 50);
     if (/\.fbx$/i.test(src) && exists(cfg.fbx2gltf)) {
       try {
         await run(cfg.fbx2gltf, ["--binary", "--input", src, "--output", glb.replace(/\.glb$/i, "")], "FBX2glTF");
@@ -244,6 +253,22 @@
     }
     if (!exists(glb)) throw new Error("Не получилось собрать GLB");
     return glb;
+  }
+
+  // One export at a time (each one loads a whole game bundle); callers share an in-flight export.
+  let exportChain = Promise.resolve();
+  const inflight = new Map();
+
+  function getGlb(m, step, wanted) {
+    const key = glbPath(m);
+    if (exists(key)) return Promise.resolve(key);
+    if (inflight.has(key)) return inflight.get(key);
+    const job = () => { if (wanted && !wanted()) throw CANCELLED; return exportGlb(m, step); };
+    const p = exportChain.then(job, job);
+    exportChain = p.catch(() => {});
+    const tracked = p.finally(() => inflight.delete(key));
+    inflight.set(key, tracked);
+    return tracked;
   }
 
   async function turntable(glb, step) {
@@ -266,9 +291,9 @@
     if (!m || busy) return;
     busy = true;
     const step = (text, pct) => goProgress(text, pct);
-    step("Запускаю…", 4);
+    step(exists(glbPath(m)) ? "Запускаю…" : "Готовлю модель…", 8);
     try {
-      const glb = await exportGlb(m, step);
+      const glb = await getGlb(m, step);
       if (HOST === "AEFT") {
         step("Добавляю в композицию…", 92);
         await evalHost("rust3dImportAE", [glb, cfg.width, cfg.height, cfg.fps]);
@@ -285,6 +310,153 @@
     }
     busy = false;
     render(false);
+  }
+
+  // ================================================================ 3D preview
+
+  let viewer = null;
+  let previewFor = null;
+  let previewTimer = null;
+
+  function loadThree() {
+    if (!loadThree.p) {
+      loadThree.p = Promise.all([
+        import("three"),
+        import("three/addons/loaders/GLTFLoader.js"),
+        import("three/addons/controls/OrbitControls.js"),
+      ]).catch(e => { loadThree.p = null; throw e; });
+    }
+    return loadThree.p;
+  }
+
+  async function ensureViewer() {
+    if (viewer) return viewer;
+    const [THREE, { GLTFLoader }, { OrbitControls }] = await loadThree();
+    const canvas = $("#view");
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    const scene = new THREE.Scene();
+    scene.add(new THREE.HemisphereLight(0xfff4e6, 0x2a1d16, 1.8));
+    const key = new THREE.DirectionalLight(0xffffff, 2.4);
+    key.position.set(3, 5, 4);
+    scene.add(key);
+    const rim = new THREE.DirectionalLight(0xe8703f, 1.4);
+    rim.position.set(-4, 2, -3);
+    scene.add(rim);
+    const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 1000);
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.enablePan = false;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 2.4;
+    canvas.addEventListener("pointerdown", () => (controls.autoRotate = false));
+    viewer = { THREE, loader: new GLTFLoader(), renderer, scene, camera, controls, model: null };
+
+    const resize = () => {
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      if (!w || !h) return;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    };
+    new ResizeObserver(resize).observe(canvas);
+    resize();
+    (function loop() {
+      requestAnimationFrame(loop);
+      if ($("#stage").classList.contains("hidden")) return;
+      controls.update();
+      renderer.render(scene, camera);
+    })();
+    return viewer;
+  }
+
+  function disposeModel(obj) {
+    obj.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      [].concat(o.material || []).forEach(mat => {
+        for (const k in mat) if (mat[k] && mat[k].isTexture) mat[k].dispose();
+        mat.dispose();
+      });
+    });
+  }
+
+  async function showModel(glb, m) {
+    const v = await ensureViewer();
+    const buf = fs.readFileSync(glb);
+    const data = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    const gltf = await new Promise((res, rej) => v.loader.parse(data, "", res, rej));
+    if (previewFor !== m) { disposeModel(gltf.scene); return; }
+    if (v.model) { v.scene.remove(v.model); disposeModel(v.model); }
+
+    const obj = gltf.scene;
+    const box = new v.THREE.Box3().setFromObject(obj);
+    const center = box.getCenter(new v.THREE.Vector3());
+    const radius = Math.max(box.getSize(new v.THREE.Vector3()).length() / 2, 1e-3);
+    obj.position.sub(center);
+    v.scene.add(obj);
+    v.model = obj;
+
+    const fov = (v.camera.fov * Math.PI) / 180;
+    const dist = (radius / Math.sin(Math.min(fov, fov * v.camera.aspect) / 2)) * 1.05;
+    v.camera.position.set(0.62, 0.38, 0.69).normalize().multiplyScalar(dist);
+    v.camera.near = dist / 100;
+    v.camera.far = dist * 100;
+    v.camera.updateProjectionMatrix();
+    v.controls.target.set(0, 0, 0);
+    v.controls.autoRotate = true;
+    v.controls.update();
+    stageState("ready");
+    setTimeout(() => saveThumb(m), 350);
+  }
+
+  function saveThumb(m) {
+    if (previewFor !== m || exists(thumbPath(m))) return;
+    const src = $("#view");
+    const size = 96, s = Math.min(src.width, src.height);
+    if (!s) return;
+    const c = document.createElement("canvas");
+    c.width = c.height = size;
+    c.getContext("2d").drawImage(src, (src.width - s) / 2, (src.height - s) / 2, s, s, 0, 0, size, size);
+    fs.writeFileSync(thumbPath(m), Buffer.from(c.toDataURL("image/png").split(",")[1], "base64"));
+    const ico = document.querySelector(`.item[data-i="${m.i}"] .ico`);
+    if (ico) ico.innerHTML = `<img src="${fileUrl(thumbPath(m))}">`;
+  }
+
+  function stageState(kind, text) {
+    const overlay = $("#stageOverlay");
+    overlay.classList.toggle("off", kind === "ready");
+    overlay.classList.toggle("err", kind === "error");
+    if (text) $("#stageText").textContent = text;
+  }
+
+  function hidePreview() {
+    previewFor = null;
+    $("#stage").classList.add("hidden");
+  }
+
+  function schedulePreview(m) {
+    previewFor = m;
+    $("#stage").classList.remove("hidden");
+    stageState("loading", exists(glbPath(m)) ? "Загружаю…" : "Достаю модель из игры…");
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => runPreview(m), 250);
+  }
+
+  async function runPreview(m) {
+    if (previewFor !== m) return;
+    try {
+      const glb = await getGlb(m, text => { if (previewFor === m) stageState("loading", text); }, () => previewFor === m);
+      if (previewFor !== m) return;
+      stageState("loading", "Загружаю предпросмотр…");
+      await showModel(glb, m);
+    } catch (e) {
+      if (e === CANCELLED || previewFor !== m) return;
+      const offline = /fetch|import|module/i.test(e.message);
+      stageState("error", offline ? "Для предпросмотра нужен интернет (загрузка 3D-движка)" : e.message);
+      log("! предпросмотр: " + e.message);
+    }
   }
 
   // ================================================================ UI
@@ -304,6 +476,10 @@
     return { q, hits: q ? models.filter(m => m.lname.includes(q) || m.lcont.includes(q)) : models };
   }
 
+  function icon(m) {
+    return exists(thumbPath(m)) ? `<img src="${fileUrl(thumbPath(m))}">` : "3D";
+  }
+
   function render(animate) {
     const { q, hits } = filtered();
     const list = $("#list");
@@ -318,7 +494,7 @@
       const scroll = list.scrollTop;
       list.innerHTML = hits.slice(0, LIST_LIMIT).map((m, n) =>
         `<div class="item${m === selected ? " sel" : ""}" data-i="${m.i}" style="animation-delay:${Math.min(n, 16) * 14}ms">
-           <span class="ico">3D</span>
+           <span class="ico">${icon(m)}</span>
            <span class="t"><b>${highlight(m.name, q)}</b><small>${esc(m.container || path.basename(m.bundle))}</small></span>
            ${exists(glbPath(m)) ? '<span class="ready" title="Уже выгружена — вставится мгновенно">✓</span>' : ""}
          </div>`).join("") +
@@ -330,19 +506,21 @@
   }
 
   function select(m) {
+    if (!m) return;
     selected = m;
     document.querySelectorAll(".item.sel").forEach(el => el.classList.remove("sel"));
     const el = document.querySelector(`.item[data-i="${m.i}"]`);
     if (el) { el.classList.add("sel"); el.scrollIntoView({ block: "nearest" }); }
     $("#selName").textContent = m.name;
     if (!busy) $("#go").disabled = false;
+    if (previewFor !== m) schedulePreview(m);
   }
 
   const EMPTY = {
     setup: ["Нужна установка", "Запусти install.bat из папки Rust3D — он скачает AssetStudio и конвертер."],
     rust: ["Укажи папку Rust", "Открой настройки (шестерёнка) и выбери папку с игрой из Steam."],
     scanning: ["Читаю файлы игры", "Модели появятся здесь по мере чтения. Это нужно только один раз."],
-    none: ["Моделей пока нет", "Нажми «Перечитать игру» в настройках."],
+    none: ["Моделей не нашлось", "Открой настройки → «Перечитать игру». Если снова пусто — пришли журнал оттуда же."],
   };
 
   function showEmpty(kind) {
@@ -436,6 +614,14 @@
     if (key === "exportDir") render(false);
   }
 
+  function startUpdate() {
+    const ps1 = cfg.installDir && path.join(cfg.installDir, "installer", "install.ps1");
+    if (!exists(ps1)) { toast("Запусти update.bat из папки Rust3D", true); return; }
+    cp.spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-WindowStyle", "Hidden", "-File", ps1, "-Update"],
+             { detached: true, windowsHide: true }).unref();
+    toast("Открываю обновление… После него закрой и снова открой панель.");
+  }
+
   // ---------------------------------------------------------------- wiring
 
   function init() {
@@ -446,9 +632,15 @@
     let timer;
     $("#q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => render(true), 120); });
     $("#q").addEventListener("keydown", e => {
-      if (e.key !== "Enter") return;
-      if (selected) sendSelected();
-      else { const first = filtered().hits[0]; if (first) select(first); }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        const hits = filtered().hits.slice(0, LIST_LIMIT);
+        const at = hits.indexOf(selected);
+        select(hits[Math.max(0, Math.min(hits.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)))]);
+        e.preventDefault();
+      } else if (e.key === "Enter") {
+        if (selected) sendSelected();
+        else select(filtered().hits[0]);
+      }
     });
     $("#list").addEventListener("click", e => {
       const el = e.target.closest(".item");
@@ -461,6 +653,7 @@
     $("#drawer").addEventListener("click", e => { if (e.target.id === "drawer") closeDrawer(); });
     document.querySelectorAll(".field button").forEach(b => b.addEventListener("click", () => pick(b.closest(".field"))));
     $("#rescan").addEventListener("click", () => { closeDrawer(); scan(true); });
+    $("#update").addEventListener("click", startUpdate);
     $("#openFolder").addEventListener("click", () => {
       fs.mkdirSync(cfg.exportDir, { recursive: true });
       cp.spawn("explorer", [cfg.exportDir], { detached: true });
