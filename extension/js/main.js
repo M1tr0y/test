@@ -2,7 +2,7 @@
  *
  * Scan:    one AssetStudioModCLI "info" run per .bundle, several in parallel; the model
  *          index is cached per bundle (size + mtime). Meshes are grouped by name without
- *          the _LODn suffix and only the best LOD is listed.
+ *          the _LODn suffix and only the best LOD is listed, named after its game folder.
  * Preview: stage 1 exports just the mesh (fast, loads only meshes) and shows it as clay;
  *          stage 2 exports the textured object and swaps it in. Selecting another model
  *          kills the running preview export.
@@ -30,13 +30,30 @@
   const LOD_RE = /[_\s.-]*lod[_\s]?(\d+)$/i;
   const CANCELLED = new Error("cancelled");
 
+  // Folders in container paths that say nothing about what the model is.
+  const NOISE_DIRS = new Set(["assets", "content", "prefabs", "prefab", "bundled", "models", "model", "meshes", "mesh",
+    "fbx", "lod", "lods", "gibs", "gib", "source", "sources", "art", "resources", "common", "shared", "new"]);
+  const CATEGORIES = {
+    weapons: "Оружие", weapon: "Оружие", guns: "Оружие", ammo: "Патроны", attachments: "Модули оружия",
+    tools: "Инструменты", tool: "Инструменты", clothing: "Одежда", attire: "Одежда", wearable: "Одежда",
+    vehicles: "Техника", vehicle: "Техника", boats: "Техника", npc: "NPC", animals: "Животные",
+    player: "Игрок", deployable: "Размещаемое", deployables: "Размещаемое", building: "Строительство",
+    "building core": "Строительство", items: "Предметы", food: "Еда", misc: "Разное", nature: "Природа",
+    environment: "Окружение", monument: "Памятники", monuments: "Памятники", props: "Декор", prop: "Декор",
+    resource: "Ресурсы", resources: "Ресурсы", ores: "Ресурсы", trees: "Деревья", rocks: "Камни и скалы",
+    effects: "Эффекты", fx: "Эффекты", ui: "Интерфейс", xmas: "Новый год", halloween: "Хэллоуин",
+    electric: "Электрика", electrical: "Электрика", io: "Электрика", instruments: "Музыка",
+  };
+  // Debris, collision and helper meshes: hidden unless "show helper meshes" is on.
+  const JUNK_RE = /(^|[_\s.-])(gibs?|collider|col|coll|collision|shadow|occluder|lodgroup|dummy|placeholder)([_\s.\d-]|$)/i;
+
   const HOST = JSON.parse(window.__adobe_cep__.getHostEnvironment()).appName;  // "AEFT" | "PPRO"
   const EXT_DIR = extensionDir();
 
   const DEFAULTS = {
     rustDir: "", blender: "", assetStudio: "", fbx2gltf: "", installDir: "",
     exportDir: path.join(os.homedir(), "Documents", "Rust3D"),
-    width: 1920, height: 1080, fps: 30, turntableSeconds: 6,
+    width: 1920, height: 1080, fps: 30, turntableSeconds: 6, showJunk: false,
   };
   let cfg = Object.assign({}, DEFAULTS, readJson(CONFIG, {}));
   let index = { version: INDEX_VERSION, bundles: {} };
@@ -133,6 +150,29 @@
     });
   }
 
+  // ================================================================ names
+
+  // "ch47" -> "CH47", "hazmat_suit" -> "Hazmat Suit".
+  function prettify(s) {
+    return s.replace(/[_-]+/g, " ").trim().split(/\s+/).map(w =>
+      /\d/.test(w) && /[a-z]/i.test(w) && w.length <= 6 ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1)
+    ).join(" ");
+  }
+
+  // Readable name, category and junk flag from the container path, e.g.
+  // assets/prefabs/npc/ch47/model/gibs/x.fbx -> label "CH47", category "NPC", junk (gibs).
+  function describe(m) {
+    const parts = (m.container || "").toLowerCase().split("/").filter(Boolean);
+    const dirs = parts.slice(0, -1).filter(p => !NOISE_DIRS.has(p));
+    const object = dirs.length ? dirs[dirs.length - 1] : "";
+    const catKey = dirs.find(d => CATEGORIES[d]);
+    m.label = object ? prettify(object) : prettify(m.base);
+    m.category = catKey ? CATEGORIES[catKey] : (dirs[0] ? prettify(dirs[0]) : "");
+    m.junk = JUNK_RE.test(m.base) || parts.includes("gibs") || parts.includes("colliders");
+    m.sameName = m.label.toLowerCase().replace(/\s+/g, "") === m.base.toLowerCase().replace(/[_\s-]+/g, "");
+    m.search = [m.label, m.base, m.category, m.container || ""].join(" ").toLowerCase();
+  }
+
   // ================================================================ scan
 
   function bundlesRoot() {
@@ -166,13 +206,15 @@
         best.set(key, { name: m.name, base: base || m.name, level, container: m.container, pathId: m.pathId, bundle });
       }
     }
-    const list = Array.from(best.values());
-    list.forEach(m => {
+    const list = [];
+    for (const m of best.values()) {
       m.title = m.base;
       m.lname = m.name.toLowerCase();
-      m.search = (m.base + " " + (m.container || "")).toLowerCase();
-    });
-    list.sort((a, b) => a.title.localeCompare(b.title, "en", { sensitivity: "base" }));
+      describe(m);
+      if (cfg.showJunk || !m.junk) list.push(m);
+    }
+    list.sort((a, b) => a.label.localeCompare(b.label, "en", { sensitivity: "base" })
+                     || a.title.localeCompare(b.title, "en", { sensitivity: "base" }));
     list.forEach((m, i) => (m.i = i));
     const keep = selected && list.find(m => idOf(m) === idOf(selected));
     models = list;
@@ -359,12 +401,12 @@
       if (HOST === "AEFT") {
         step("Добавляю в композицию…", 92);
         await evalHost("rust3dImportAE", [glb, cfg.width, cfg.height, cfg.fps]);
-        goDone(`«${m.title}» в композиции`);
+        goDone(`«${m.label}» в композиции`);
       } else {
         const mov = await turntable(glb, step);
         step("Кладу на таймлайн…", 96);
         const res = await evalHost("rust3dImportPPRO", [mov, cfg.turntableSeconds]);
-        goDone(res === "ok:timeline" ? `«${m.title}» на таймлайне` : `«${m.title}» в папке Rust3D проекта`);
+        goDone(res === "ok:timeline" ? `«${m.label}» на таймлайне` : `«${m.label}» в папке Rust3D проекта`);
       }
     } catch (e) {
       log("! " + e.message);
@@ -600,17 +642,22 @@
       list.classList.toggle("quiet", !animate);
       const scroll = list.scrollTop;
       list.innerHTML = hits.slice(0, LIST_LIMIT).map((m, n) =>
-        `<div class="item${m === selected ? " sel" : ""}" data-i="${m.i}" style="animation-delay:${Math.min(n, 16) * 14}ms">
+        `<div class="item${m === selected ? " sel" : ""}" data-i="${m.i}" title="${esc(m.container || m.name)}" style="animation-delay:${Math.min(n, 16) * 14}ms">
            <span class="ico">${icon(m)}</span>
-           <span class="t"><b>${highlight(m.title, q)}</b><small>${esc(m.container || path.basename(m.bundle))}</small></span>
+           <span class="t">
+             <b>${highlight(m.label, q)}${m.sameName ? "" : ` <em>${highlight(m.title, q)}</em>`}</b>
+             <small>${m.category ? `<i class="cat">${esc(m.category)}</i>` : ""}${m.junk ? '<i class="cat junk">служебная</i>' : ""}${esc(m.container || path.basename(m.bundle))}</small>
+           </span>
            ${exists(glbPath(m)) ? '<span class="ready" title="Уже выгружена — вставится мгновенно">✓</span>' : ""}
          </div>`).join("") +
         (hits.length > LIST_LIMIT ? `<div class="more">Показано ${LIST_LIMIT} из ${hits.length.toLocaleString("ru")} — уточни поиск</div>` : "");
       if (!animate) list.scrollTop = scroll;
     }
-    $("#selName").textContent = selected ? selected.title : "не выбрана";
+    $("#selName").textContent = selected ? selName(selected) : "не выбрана";
     if (!busy) $("#go").disabled = !selected;
   }
+
+  const selName = m => (m.sameName ? m.label : `${m.label} · ${m.title}`);
 
   function select(m) {
     if (!m) return;
@@ -618,7 +665,7 @@
     document.querySelectorAll(".item.sel").forEach(el => el.classList.remove("sel"));
     const el = document.querySelector(`.item[data-i="${m.i}"]`);
     if (el) { el.classList.add("sel"); el.scrollIntoView({ block: "nearest" }); }
-    $("#selName").textContent = m.title;
+    $("#selName").textContent = selName(m);
     if (!busy) $("#go").disabled = false;
     if (previewFor !== idOf(m)) schedulePreview(m);
   }
@@ -704,6 +751,7 @@
       val.title = v || "";
       val.classList.toggle("missing", !exists(v));
     });
+    $("#showJunk").checked = !!cfg.showJunk;
   }
 
   function openDrawer() { renderFields(); renderLog(); $("#drawer").classList.add("open"); }
@@ -759,6 +807,12 @@
     $("#closeSettings").addEventListener("click", closeDrawer);
     $("#drawer").addEventListener("click", e => { if (e.target.id === "drawer") closeDrawer(); });
     document.querySelectorAll(".field button").forEach(b => b.addEventListener("click", () => pick(b.closest(".field"))));
+    $("#showJunk").addEventListener("change", e => {
+      cfg.showJunk = e.target.checked;
+      writeJson(CONFIG, cfg);
+      rebuildModels();
+      render(true);
+    });
     $("#rescan").addEventListener("click", () => { closeDrawer(); scan(true); });
     $("#update").addEventListener("click", startUpdate);
     $("#openFolder").addEventListener("click", () => {
